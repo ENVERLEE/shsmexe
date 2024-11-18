@@ -26,10 +26,9 @@ class ResearchService:
         self.perplexity_service = perplexity_service
         self.logger = logging.getLogger(__name__)
         
-        
         # API 클라이언트 초기화
-        self.anthropic = anthropic.Anthropic(api_key=XAI_API_KEY, base_url="https://api.x.ai",)  # api_key는 환경변수에서 로드
-        self.voyage = voyageai.Client()  # api_key는 환경변수에서 로드
+        self.anthropic = anthropic.Anthropic(api_key=XAI_API_KEY, base_url="https://api.x.ai",)
+        self.voyage = voyageai.Client()
         
         # BERT 모델 초기화
 
@@ -987,7 +986,6 @@ class ResearchService:
             """
 
         return base_prompt
-class ResearchService:
     async def _fetch_literature(self, keywords: List[str], project: Project) -> List[Dict]:
         """Perplexica API를 사용하여 선행연구 자료 수집"""
         search_results = []

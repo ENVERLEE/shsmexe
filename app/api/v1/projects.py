@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Response
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
 from typing import List, Optional, Any, Dict, Literal
 from datetime import datetime
@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 import json
 import os
 from datetime import timezone
+
 
 # Status Enums for type safety
 class ProjectStatus(str, Enum):
@@ -136,6 +137,28 @@ perplexityservice = PerplexityService(api_key=pplx_api_key)
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+def get_research_service(db: Session = Depends(get_db)) -> ResearchService:
+    try:
+        mlx_service = MLXService()
+        perplexity_api_key = os.getenv("PERPLEXITY_API_KEY")
+        if not perplexity_api_key:
+            raise HTTPException(
+                status_code=500,
+                detail="PERPLEXITY_API_KEY environment variable is not set"
+            )
+        perplexity_service = PerplexityService(api_key=perplexity_api_key)
+        return ResearchService(
+            db=db,
+            mlx_service=mlx_service,
+            perplexity_service=perplexity_service
+        )
+    except Exception as e:
+        logger.error(f"Error creating ResearchService: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Service initialization failed: {str(e)}"
+        )
+    
 def get_project_status(project: Project) -> ProjectStatus:
     """Helper function to determine project status"""
     if project.completed_steps == project.total_steps and project.total_steps > 0:
@@ -276,7 +299,28 @@ def create_project(
     current_user: int = Depends(get_current_user)
 ) -> ProjectResponse:
     try:
-        research_service = ResearchService(db, mlx_service, perplexityservice)
+        # MLXService와 PerplexityService 초기화
+        mlx_service = MLXService()
+        
+        # Perplexity API 키 확인
+        perplexity_api_key = os.getenv("PERPLEXITY_API_KEY")
+        if not perplexity_api_key:
+            raise HTTPException(
+                status_code=500,
+                detail="PERPLEXITY_API_KEY environment variable is not set"
+            )
+        
+        # PerplexityService 인스턴스 생성
+        perplexity_service = PerplexityService(api_key=perplexity_api_key)
+        
+        # ResearchService 인스턴스 생성 - 필요한 의존성 모두 전달
+        research_service = ResearchService(
+            db=db,
+            mlx_service=mlx_service,
+            perplexity_service=perplexity_service
+        )
+        
+        # 프로젝트 생성
         new_project = research_service.create_project(
             user_id=current_user,
             project_data=project.model_dump()

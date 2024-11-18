@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from enum import Enum
 import logging
 from typing_extensions import Literal
+import re
 
 # Define types for better type hinting
 RecencyFilter = Literal["day", "week", "month", "year", "all"]

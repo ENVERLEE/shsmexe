@@ -90,7 +90,6 @@ parameterized==0.9.0
 passlib==1.7.4
 pathspec==0.12.1
 pbr==6.1.0
-peft @ git+https://github.com/huggingface/peft.git@221965b7e140bdd47fbd04c131d56029e089902c
 pillow==11.0.0
 platformdirs==4.3.6
 pluggy==1.5.0
@@ -127,8 +126,6 @@ ruamel.yaml.clib==0.2.12
 safetensors==0.4.5
 safety==3.2.11
 safety-schemas==0.0.9
-scikit-learn==1.5.2
-scipy==1.14.1
 sentencepiece==0.2.0
 setuptools==75.5.0
 shellingham==1.5.4

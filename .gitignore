@@ -1,0 +1,6 @@
+shsm/
+scanner.py
+build/
+dist/
+logs/
+.env

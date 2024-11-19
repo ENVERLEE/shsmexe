@@ -1,6 +1,8 @@
-from typing import List, Dict
+from typing import List, Dict, Optional
 from datetime import datetime
 import pandas as pd
+from docx import Document
+from docx.shared import Pt
 import numpy as np  # 누락된 import 추가
 import json
 from sqlalchemy.orm import Session
@@ -11,28 +13,52 @@ import anthropic
 import voyageai
 from dotenv import load_dotenv
 from .mlx_service import MLXService
-from .perplexity_service import PerplexityService
+from .perplexity_service import PerplexityService, SearchConfig
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 import requests
+import ssl
+import aiohttp
+import asyncio
 
 load_dotenv()
 XAI_API_KEY = os.getenv("XAI_API_KEY")
 
+API_URL = "https://api-inference.huggingface.co/models/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+headers = {"Authorization": "Bearer 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"}  # Replace with your actual token
 class ResearchService:
     def __init__(self, db: Session, mlx_service: MLXService, perplexity_service: PerplexityService):
+        """Initialize ResearchService with improved SSL handling"""
         self.db = db
         self.mlx_service = mlx_service
-        self.perplexity_service = perplexity_service
-        self.logger = logging.getLogger(__name__)
         
-        # API 클라이언트 초기화
-        self.anthropic = anthropic.Anthropic(api_key=XAI_API_KEY, base_url="https://api.x.ai",)
-        self.voyage = voyageai.Client()
-        
-        # BERT 모델 초기화
+        # PerplexityService 초기화 개선
+        try:
+            perplexity_api_key = os.getenv("PERPLEXITY_API_KEY")
+            if not perplexity_api_key:
+                raise ValueError("PERPLEXITY_API_KEY environment variable not found")
+            
+            self.perplexity_service = PerplexityService(api_key=perplexity_api_key)
+            self.logger = logging.getLogger(__name__)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to initialize PerplexityService: {str(e)}")
+            raise
 
-        # Define search filters by research domain
+        # API 클라이언트 초기화
+        try:
+            self.anthropic = anthropic.Anthropic(
+                api_key=os.getenv("XAI_API_KEY"), 
+                base_url="https://api.x.ai"
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to initialize Anthropic client: {e}")
+            self.anthropic = None
+            
+            # BERT 모델 초기화
+
+            # Define search filters by research domain
         self.search_domain_filter = {
             "military": [
                 "military", "defense", "security", "strategy", "tactics", "weapons", 
@@ -530,11 +556,11 @@ class ResearchService:
             self.logger.error(f"Error extracting risk assessment: {str(e)}")
         
         return {"risks": risks}
-
-    def _classify_section(self, text: str) -> str:
+    
+    def _classify_section(self, text: str) -> Optional[str]:
         if not text.strip():
             return None
-                
+        
         # Section keywords for initial filtering
         section_keywords = {
             "description": ["description", "step description", "**description**"],
@@ -553,44 +579,38 @@ class ResearchService:
             if any(keyword.lower() in text for keyword in keywords):
                 return section
 
-        # API configuration
-        API_URL = "https://api-inference.huggingface.co/models/BAAI/bge-base-en-v1.5"
-        headers = {"Authorization": "Bearer apikeyexample"}
-
+        # Prepare sentences for comparison
+        sentences_to_compare = list(section_keywords.keys())
+        
         try:
-            # Sample texts for each category to enable zero-shot classification
-            category_examples = {
-                "description": "This section describes the main objectives and goals",
-                "keywords": "Key terms and important concepts: analysis, research, methodology",
-                "methodology": "The approach used will involve quantitative analysis",
-                "output_format": "The final deliverable will be a comprehensive report"
-            }
-            
-            # Prepare API payload with text and examples
+            # Prepare payload for API call
             payload = {
                 "inputs": {
                     "source_sentence": text,
-                    "sentences": list(category_examples.values())
+                    "sentences": sentences_to_compare
                 }
             }
-            
+            def query(payload):
+                response = requests.post(API_URL, headers=headers, json=payload)
+                return response.json()
             # Make API call
-            response = requests.post(API_URL, headers=headers, json=payload)
-            response.raise_for_status()
+            output = query(payload)
             
-            # Process API response
-            similarities = response.json()
-            
-            # Find the category with highest similarity
-            max_similarity_index = similarities.index(max(similarities))
-            predicted_category = list(category_examples.keys())[max_similarity_index]
-            
-            return predicted_category
-            
+            # Check if the API returned embeddings
+            if 'embeddings' in output:
+                # Assuming the API returns similarities or you calculate them from embeddings
+                # For simplicity, let's assume it directly gives similarities:
+                similarities = output['embeddings']
+                max_similarity_index = similarities.index(max(similarities))
+                predicted_category = sentences_to_compare[max_similarity_index]
+                return predicted_category
+            else:
+                self.logger.warning(f"Unexpected API response format: {output}")
+                return "description"  # Default fallback if we can't interpret the response
+        
         except Exception as e:
-            self.logger.warning(f"API classification failed: {str(e)}")
-            return "description"  # Default fallback
-
+            self.logger.warning(f"API call failed: {str(e)}")
+            return "description"
     def create_project(self, user_id: int, project_data: Dict) -> Project:
         """Enhanced project creation with new structure"""
         try:
@@ -834,55 +854,145 @@ class ResearchService:
         
         # Sort by relevance score
         return sorted(filtered_keywords, key=lambda k: relevance_scores[k], reverse=True)
-    def execute_all_steps(self, project_id: int) -> Dict:
-        """모든 연구 단계 실행"""
-        project = self.db.query(Project).get(project_id)
-        if not project:
-            raise HTTPException(status_code=404, detail="Project not found")
-        
+
+
+
+    async def _generate_final_report(self, project: Project, results: List[Dict]) -> Dict:
+        """Generate comprehensive final research report using Claude API"""
         try:
-            steps = self.db.query(ResearchStep).filter_by(
-                project_id=project_id
-            ).order_by(ResearchStep.step_number).all()
+            # Ensure that the Anthropic client is initialized
+            if self.anthropic is None:
+                raise Exception("Anthropic client is not initialized. Please check the API key or base URL.")
+
+            # Convert step results to formatted string
+            steps_results = "\n\n".join([
+                f"[Stage {i+1} Results]\n{result['result']}"
+                for i, result in enumerate(results)
+            ])
+            prompt = f"""
+                        You are a highly skilled research analyst specializing in military and security projects. Your task is to synthesize research results into a comprehensive, detailed, and professional final report. Please carefully review the following project information and research results:
+
+<project_title>
+{project.title}
+</project_title>
+
+<project_description>
+{project.description}
+</project_description>
+
+<project_evaluation_plan>
+{project.evaluation_plan}
+</project_evaluation_plan>
+
+<steps_results>
+{steps_results}
+</steps_results>
+
+Your goal is to create a final report that adheres to the following format:
+
+<submission_format>
+{project.submission_format}
+</submission_format>
+
+Before writing the final report, please conduct a thorough analysis of the provided information in <research_breakdown> tags to show your thought process and ensure a comprehensive understanding of the project and its results.
+
+Instructions for analysis:
+1. Carefully review the project title, description, and evaluation plan.
+2. Examine the stage-wise research results in detail.
+3. Identify key findings, trends, and patterns in the research.
+4. Consider the practical applications of the research in a military/security context.
+5. Determine actionable insights that would be valuable to stakeholders.
+6. Assess any security implications or sensitivities in the research.
+7. Plan how to structure the information to ensure a logical flow in the final report.
+8. Consider how to maintain research consistency and completeness throughout the report.
+9. Summarize key points from each section of the project information.
+10. Identify and list potential challenges or limitations in the research.
+11. Outline a preliminary structure for the final report.
+
+After completing your analysis, write the final report according to the specified format. Ensure that your report is as detailed and professional as possible, demonstrating a high level of expertise in the subject matter.
+
+Guidelines for the final report:
+1. Maintain a logical flow between sections, ensuring that each part of the report builds upon the previous information.
+2. Emphasize practical applications in the military/security context, clearly explaining how the research findings can be implemented or utilized.
+3. Provide specific, actionable insights for stakeholders, detailing how they can leverage the research results.
+4. Address security implications and sensitivities with appropriate caution and discretion.
+5. Use precise, technical language where appropriate, but ensure clarity for a professional audience.
+6. Include relevant data, statistics, and examples to support your conclusions and recommendations.
+7. Be as comprehensive as possible, exploring all aspects of the research in depth.
+8. Conclude with a strong summary that reinforces the key findings and their significance.
+
+Remember, the quality and depth of your report are crucial. Take the time to craft a document that truly reflects the importance and complexity of the research.
+
+Please begin your response with your analysis, followed by the final report.
+            """
             
-            results = []
+            # 동기적으로 API 호출
+            response = self.anthropic.messages.create(
+                model="grok-beta",
+                max_tokens=4000,
+                temperature=0.3,
+                system="You are a senior security research expert crafting a comprehensive final report with deep understanding of military and security domains.",
+                messages=[{"role": "user", "content": prompt}]
+            )
+            english_report = response.content[0].text
             
-            for step in steps:
-                try:
-                    # 단계 시작
-                    step.status = 'in_progress'
-                    step.started_at = datetime.utcnow()
-                    self.db.commit()
-                    
-                    # 단계 실행
-                    result = self._execute_step(step, project)
-                    
-                    # 성공 처리
-                    step.status = 'completed'
-                    step.completed_at = datetime.utcnow()
-                    step.result = result
-                    project.completed_steps += 1
-                    results.append(result)
-                    
-                except Exception as e:
-                    # 실패 처리
-                    step.status = 'failed'
-                    step.error_message = str(e)
-                    self.logger.error(f"Step {step.step_number} execution failed: {e}")
-                
-                self.db.commit()
+            # 비동기 작업을 동기적으로 처리
+            korean_report = self._translate_report_sections(english_report)
             
-            # 최종 보고서 생성 및 저장
-            final_result = self._generate_final_report(project, results)
+            # 최종 보고서 저장
+            project.metadata1 = project.metadata1 or {}
+            project.metadata1['final_reports'] = {
+                'final_report_en': english_report,
+                'final_report_kr': korean_report,
+                'generated_at': datetime.utcnow().isoformat()
+            }
+            project.evaluation_status = "completed"
             
-            return final_result
-                
-        except Exception as e:
-            project.evaluation_status = 'failed'
+            # English report to DOCX
+            self._save_report_to_docx(english_report, f"final_report_en_{project.id}.docx")
+            
+            # Korean report to DOCX
+            self._save_report_to_docx(korean_report, f"final_report_kr_{project.id}.docx")
+            
             self.db.commit()
-            self.logger.error(f"Research execution failed: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"연구 실행 실패: {str(e)}")
-        
+
+            return {
+                "project_id": project.id,
+                "title": project.title,
+                "final_report_en": english_report,
+                "final_report_kr": korean_report,
+                "step_results": results,
+                "generated_at": datetime.utcnow().isoformat(),
+                "status": "completed"
+            }
+
+        except Exception as e:
+            self.logger.error(f"Final report generation failed: {str(e)}")
+            raise
+
+    def _save_report_to_docx(self, report_text: str, filename: str):
+        """Save report text to a DOCX file."""
+        try:
+            doc = Document()
+            doc.add_heading('Final Research Report', level=1)
+            
+            # Add content
+            for section in report_text.split('\n\n'):
+                if section.startswith('#') or section.strip().isupper():
+                    # Section header
+                    doc.add_heading(section, level=2)
+                else:
+                    # Regular content
+                    doc.add_paragraph(section)
+            
+            # Save the document
+            doc.save(f"reports/{filename}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to save report as DOCX: {str(e)}")
+            raise
+
+
     def _generate_step_prompt(self, step: ResearchStep, project: Project, literature: List[Dict]) -> str:
         """Generate stage-specific research prompts including prior research"""
         base_prompt = f"""
@@ -986,39 +1096,62 @@ class ResearchService:
             """
 
         return base_prompt
-    async def _fetch_literature(self, keywords: List[str], project: Project) -> List[Dict]:
-        """Perplexica API를 사용하여 선행연구 자료 수집"""
-        search_results = []
+    
+    async def _fetch_literature(self, keywords: List[str]) -> List[Dict]:
+        """Fetch literature using Perplexity AI API with SSL verification disabled"""
+        literature = []
         
         try:
-            for keyword in keywords:
-                # query를 문자열로 직접 전달
-                query = f"Research papers and academic articles about {keyword} in context of {project.title}"
-                
-                # Perplexity API 호출
-                try:
-                    response = await self.perplexity_service.search_references(query)
-                    
-                    if isinstance(response, dict) and 'references' in response:
-                        search_results.extend(response['references'])
-                except Exception as e:
-                    self.logger.error(f"API call failed for keyword {keyword}: {str(e)}")
-                    continue
+            # SSL 검증을 비활성화한 컨텍스트 생성 추가
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
             
-            # 결과 중복 제거 및 정렬
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            
+            async with aiohttp.ClientSession(connector=connector) as session:
+                for keyword in keywords:
+                    try:
+                        query = f"Academic references on {keyword}"
+                        config = SearchConfig(
+                            search_domain="academic",
+                            search_recency_filter="year",
+                            temperature=0.2
+                        )
+                        
+                        result = await self.perplexity_service.search_references(
+                            query=query,
+                            model="llama-3.1-sonar-small-128k-online",
+                            config=config
+                        )
+                        
+                        if result and 'references' in result:
+                            literature.extend(result['references'])
+                        
+                        await asyncio.sleep(0.5)
+                        
+                    except Exception as e:
+                        self.logger.error(f"Error fetching literature for keyword '{keyword}': {str(e)}")
+                        continue
+            
+            # 중복 제거
             seen_urls = set()
-            unique_results = []
-            for result in search_results:
-                url = result.get('url')
+            unique_literature = []
+            for item in literature:
+                url = item.get('url', '')
                 if url and url not in seen_urls:
                     seen_urls.add(url)
-                    unique_results.append(result)
+                    unique_literature.append(item)
             
-            return unique_results
+            return unique_literature
             
         except Exception as e:
-            self.logger.error(f"Literature search failed: {str(e)}")
+            self.logger.error(f"Literature fetch failed: {str(e)}")
             return []
+        
+        finally:
+            if 'connector' in locals():
+                await connector.close()
 
     async def _execute_step(self, step: ResearchStep, project: Project) -> Dict:
         """단일 연구 단계 실행"""
@@ -1027,7 +1160,7 @@ class ResearchService:
             keywords = self._extract_research_keywords(step, project)
             
             # 2. 선행 연구 수집 (비동기 호출)
-            literature = await self._fetch_literature(keywords, project)
+            literature = await self._fetch_literature(keywords)
             
             # 3. 연구 프롬프트 생성
             prompt = self._generate_step_prompt(step, project, literature)
@@ -1064,7 +1197,7 @@ class ResearchService:
             raise
 
     async def execute_all_steps(self, project_id: int) -> Dict:
-        """모든 연구 단계 실행"""
+        """모든 연구 단계 실행 with improved error handling"""
         project = self.db.query(Project).get(project_id)
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
@@ -1083,8 +1216,9 @@ class ResearchService:
                     step.started_at = datetime.utcnow()
                     self.db.commit()
                     
-                    # 단계 실행 (비동기 호출)
-                    result = await self._execute_step(step, project)
+                    # 각 단계별 타임아웃 설정
+                    async with asyncio.timeout(300):  # 5분 타임아웃
+                        result = await self._execute_step(step, project)
                     
                     # 성공 처리
                     step.status = 'completed'
@@ -1093,13 +1227,18 @@ class ResearchService:
                     project.completed_steps += 1
                     results.append(result)
                     
+                except asyncio.TimeoutError:
+                    step.status = 'failed'
+                    step.error_message = "Step execution timed out"
+                    self.logger.error(f"Step {step.step_number} timed out")
+                    
                 except Exception as e:
-                    # 실패 처리
                     step.status = 'failed'
                     step.error_message = str(e)
                     self.logger.error(f"Step {step.step_number} execution failed: {e}")
                 
-                self.db.commit()
+                finally:
+                    self.db.commit()
             
             # 최종 보고서 생성
             final_result = await self._generate_final_report(project, results)
@@ -1108,96 +1247,8 @@ class ResearchService:
         except Exception as e:
             project.evaluation_status = 'failed'
             self.db.commit()
+            self.logger.error(f"Project execution failed: {str(e)}")
             raise
-    async def _generate_final_report(self, project: Project, results: List[Dict]) -> Dict:
-        """Generate comprehensive final research report using Claude API"""
-        try:
-            # Convert step results to formatted string
-            steps_results = "\n\n".join([
-                f"[Stage {i+1} Results]\n{result['result']}"
-                for i, result in enumerate(results)
-            ])
-            prompt = f"""
-            Please synthesize the following research results into a comprehensive final report.
-
-            [Project Information]
-            Title: {project.title}
-            Description: {project.description}
-            Evaluation Plan: {project.evaluation_plan}
-            Submission Format: {project.submission_format}
-
-            [Stage-wise Research Results]
-            {steps_results}
-
-            Please structure the final report according to the following format:
-
-            1. Research Overview
-            - Background and Objectives
-            - Research Scope
-            - Methodology
-
-            2. Research Content
-            - Key Research Questions
-            - Research Framework
-            - Data Collection and Analysis
-
-            3. Research Findings
-            - Key Discoveries
-            - Analysis Results
-            - Results Interpretation
-
-            4. Conclusions and Implications
-            - Research Conclusions
-            - Policy Implications
-            - Practical Applications
-
-            5. Recommendations
-            - Policy Recommendations
-            - Future Research Suggestions
-            - Limitations
-
-            Guidelines:
-            - Ensure logical flow between sections
-            - Maintain research consistency and completeness
-            - Emphasize practical applications in military/security context
-            - Provide actionable insights for stakeholders
-            - Consider security implications and sensitivities
-            """
-            response = self.anthropic.messages.create(
-                model="grok-beta",
-                max_tokens=4000,
-                temperature=0.3,
-                system="You are a senior security research expert crafting a comprehensive final report with deep understanding of military and security domains.",
-                messages=[{"role": "user", "content": prompt}]
-            )
-            english_report = response.content[0].text
-            korean_report = await self._translate_report_sections(english_report)
-
-            # 최종 보고서 저장
-            with self.db.begin():
-                project.metadata1 = project.metadata1 or {}
-                project.metadata1['final_reports'] = {
-                    'final_report_en': english_report,
-                    'final_report_kr': korean_report,
-                    'generated_at': datetime.utcnow().isoformat()
-                }
-                project.evaluation_status = "completed"
-                self.db.commit()
-
-            return {
-                "project_id": project.id,
-                "title": project.title,
-                "final_report_en": english_report,
-                "final_report_kr": korean_report,
-                "step_results": results,
-                "generated_at": datetime.utcnow().isoformat(),
-                "status": "completed"
-            }
-
-        except Exception as e:
-            self.logger.error(f"Final report generation failed: {str(e)}")
-            raise
-
     def _translate_report_sections(self, english_report: str) -> str:
         """Translate report sections while preserving structure"""
         try:
